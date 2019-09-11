@@ -1,6 +1,9 @@
 
 import boto3
 from pathlib import Path
+import os
+from subprocess import call
+import tempfile
 from ssm_cache import SSMParameterGroup, SSMParameter, InvalidParameterError
 
 
@@ -47,6 +50,8 @@ class Stage:
     def __init__(self, project, stage_name):
         self.project = project
         self.name = stage_name
+        if self.name is None:
+            raise ParamCreateError
 
     @property
     def project_path(self):
@@ -64,8 +69,15 @@ class Stage:
         for ssm_param in group.parameters("/"):
             yield Param(ssm_param)
 
-    def validate(self, schema):
-        existing_params = set([x.name for x in self.get_params()])
+    def validate(self, schema, filename=None):
+        existing_params = set()
+        if filename:
+            with open(filename, "r") as f:
+                for line in f.readlines():
+                    existing_params.add(line.strip().split("=")[0])
+        else:
+            existing_params = set([x.name for x in self.get_params()])
+
         schema_params = set(schema.keys())
         errors = []
         for missing in existing_params.difference(schema_params):
@@ -79,13 +91,15 @@ class Stage:
         if len(errors):
             raise ParamSchemaValidationError(errors=errors)
 
+    def delete(self, config, param_name):
+        Param.delete(self.project, self.name, param_name)
+
 
 class Param:
 
     def __init__(self, ssm_param):
         self.ssm_param = ssm_param
         self.path = Path(ssm_param.full_name)
-
 
     @classmethod
     def delete(cls, project, stage_name, param_name):
@@ -98,10 +112,10 @@ class Param:
                 "Delete {} failed: {}".format(param_path, e)
             )
 
-
     @classmethod
     def create(cls, project, stage_name, param_name,
-               param_value, param_type, overwrite=False, tags={}):
+               param_value, param_type, param_desc=None,
+               overwrite=False, tags={}):
         param_path = create_param_path(project, stage_name, param_name)
 
         if param_type not in VALID_PARAM_TYPES:
@@ -114,6 +128,7 @@ class Param:
             ]
             param_resp = ssm.put_parameter(
                 Name=param_path,
+                Description=param_desc,
                 Value=param_value,
                 Type=param_type,
                 Overwrite=overwrite
@@ -162,3 +177,89 @@ class Param:
     @property
     def dotenv(self):
         return "{}={}".format(self.envname, self.value)
+
+
+class TemporaryFile:
+
+    def __init__(self, stage):
+        self.stage = stage
+        dotenv_content = []
+        for param in self.stage.get_params():
+            dotenv_content.append(param.dotenv)
+
+        # write a temporary file with the current parameters
+        f = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        f.write("\n".join(dotenv_content) + "\n")
+        f.close()
+
+        self.name = f.name
+        self.envs = {}
+
+    def open_editor(self, schema):
+        editor = os.environ.get("EDITOR")
+        if not editor:
+            editor = "vim"
+
+        call([editor, self.name])
+
+        self.validate(schema)
+
+        self.envs = {}
+        with open(self.name, "r") as tf:
+            lines = tf.readlines()
+            for line in lines:
+                env_name, env_value = line.strip().split("=")
+                self.envs[env_name] = env_value
+
+    def validate(self, schema):
+        self.stage.validate(schema, self.name)
+
+    def diff(self):
+        existing_params = {p.name: p.value for p in self.stage.get_params()}
+
+        changes = []
+        for param in self.envs:
+            if param not in existing_params:
+                changes.append("Adding param {}={}".format(param, self.envs[local_param]))
+            elif existing_params[param] != self.envs[param]:
+                changes.append("Updating param {} from {} to {}"
+                               .format(param, existing_params[param],
+                                       self.envs[param]))
+
+        for param in self.deleted_params():
+            changes.append("Deleting param {}".format(param))
+
+        return changes
+
+    def deleted_params(self):
+        deleted_params = {}
+        existing_params = {p.name: p.value for p in self.stage.get_params()}
+
+        for param in existing_params:
+            if param not in self.envs:
+                deleted_params[param] = existing_params[value]
+
+        return deleted_params
+
+    def push_updates(self, schema, tags):
+        self.validate(schema)
+        for param in self.envs:
+            param_type = schema[param][0]
+            param_desc = None
+            if len(schema[param]) > 1:
+                param_desc = schema[param][1]
+            args = [param, self.envs[param], param_type, param_desc]
+
+            Param.create(
+                self.stage.project,
+                self.stage.name,
+                *args,
+                overwrite=True,
+                tags=tags
+            )
+
+        for param in self.deleted_params():
+            self.stage.delete(param)
+
+    def delete(self):
+        os.unlink(self.name)

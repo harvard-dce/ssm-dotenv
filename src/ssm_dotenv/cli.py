@@ -2,11 +2,20 @@
 import toml
 import json
 import click
+import os
+import tempfile
+from subprocess import call
+from os.path import join, dirname
+from dotenv import load_dotenv
 from pathlib import Path
-from .params import get_stages, Stage, Param, \
+from .params import get_stages, Stage, Param, TemporaryFile, \
     ParamSchemaValidationError, ParamCreateError, ParamDeleteError
 
+env_file = join(dirname(__file__), '.env')
+load_dotenv(env_file)
+
 CONFIG_FILE = '.ssm-dotenv'
+
 
 def get_config(config_file):
     config_path = config_file and Path(config_file) or Path(CONFIG_FILE)
@@ -25,6 +34,41 @@ def update_config(config):
     config_path = ctx.meta["CONFIG_PATH"]
     with open(config_path, 'w') as f:
         toml.dump(config, f)
+
+
+def switch_to(stage):
+    with open(env_file, 'w') as f:
+        f.write("CURRENT={}".format(stage))
+
+
+def current_stage():
+    name = os.getenv('CURRENT')
+    if name == '':
+        name = None
+    return name
+
+# def push(config, input):
+#     create_args = []
+#     for line in input:
+#         param_name, param_value = line.strip().split("=")
+#         if param_name not in config["schema"]:
+#             click.echo("{} not found in schema".format(param_name))
+#             raise click.Abort()
+#         param_type = config["schema"][param_name]
+#         create_args.append([param_name, param_value, param_type])
+#     for argset in create_args:
+#         try:
+#             param = Param.create(
+#                 config["project"],
+#                 current_stage(),
+#                 *argset,
+#                 overwrite=True,
+#                 tags=config.get("tags", {})
+#             )
+#             click.echo("Created {}".format(param.full_name))
+#         except ParamCreateError as e:
+#             click.echo(e, err=True)
+#             raise click.Abort()
 
 
 @click.group()
@@ -55,7 +99,7 @@ def add(config, param_name, param_value, param_type):
     try:
         param = Param.create(
             config["project"],
-            config["stage"],
+            current_stage(),
             param_name,
             param_value,
             param_type,
@@ -74,25 +118,9 @@ def add(config, param_name, param_value, param_type):
 
 
 @cli.command()
-@click.argument('param-name')
-@click.pass_obj
-def delete(config, param_name):
-    try:
-        param_path = Param.delete(config["project"], config["stage"], param_name)
-        click.echo("Deleted {}".format(param_path))
-        if param_name in config["schema"]:
-            del config["schema"][param_name]
-            update_config(config)
-            click.echo("Schema updated")
-    except ParamDeleteError as e:
-        click.echo(e, err=True)
-        raise click.Abort()
-
-
-@cli.command()
 @click.pass_obj
 def validate(config):
-    stage = Stage(config["project"], config["stage"])
+    stage = Stage(config["project"], current_stage())
     try:
         stage.validate(config["schema"])
         click.echo("All good!")
@@ -100,57 +128,77 @@ def validate(config):
         click.echo("Schema validation errors:\n{}" \
                    .format("\n".join(e.errors)))
 
+
 @cli.command()
 @click.pass_obj
-def list_stages(config):
-    for stage in get_stages(config["project"]):
-        click.echo(stage.name)
+def switch(config):
+    """
+    Switch stages.
+    """
+
+    stages = get_stages(config["project"])
+
+    if not stages:
+        raise click.ClickException("No stages exist in the project '{}'!"
+                                   " `ssm-dotenv new` to create a new stage")
+
+    for num, stage_object in enumerate(stages):
+        stage = stage_object.name
+        click.echo("{} {} {}".format(num + 1, '*' if stage == current_stage() else ' ', stage))
+
+    num = input("\nStage number: ")
+
+    if not num.isdigit() or int(num) == 0 or int(num) > len(stages):
+        click.echo("\nEnter valid parameter number.")
+    else:ZZ
+        stage = stages[int(num) - 1].name
+        click.echo("\nSwitching to {}".format(stage))
+        switch_to(stage)
 
 
 @cli.command()
-@click.argument('output', type=click.File('w'))
-@click.option('--strict/--no-strict', is_flag=True, default=True)
 @click.pass_obj
-def pull(config, output, strict):
-    stage = Stage(config["project"], config["stage"])
-    if strict:
-        try:
-            stage.validate(config["schema"])
-        except ParamSchemaValidationError as e:
-            click.echo("Schema validation errors:\n{}" \
-                       .format("\n".join(e.errors)))
-            raise click.Abort()
-    dotenv_content = []
+def list_parameters(config):
+    stage = Stage(config["project"], current_stage())
+
+    click.echo("\nCurrent path: {}".format(stage.path))
     for param in stage.get_params():
-        dotenv_content.append(param.dotenv)
-    output.write("\n".join(dotenv_content) + "\n")
+        click.echo(param.dotenv)
 
 
 @cli.command()
-@click.argument('input', type=click.File('r'))
 @click.pass_obj
-def push(config, input):
-    create_args = []
-    for line in input:
-        param_name, param_value = line.strip().split("=")
-        if param_name not in config["schema"]:
-            click.echo("{} not found in schema".format(param_name))
-            raise click.Abort()
-        param_type = config["schema"][param_name]
-        create_args.append([param_name, param_value, param_type])
-    for argset in create_args:
+def edit(config):
+    stage = Stage(config["project"], current_stage())
+    tf = TemporaryFile(stage)
+
+    while True:
         try:
-            param = Param.create(
-                config["project"],
-                config["stage"],
-                *argset,
-                overwrite=True,
-                tags=config.get("tags", {})
-            )
-            click.echo("Created {}".format(param.full_name))
-        except ParamCreateError as e:
-            click.echo(e, err=True)
-            raise click.Abort()
+            tf.open_editor(config["schema"])
+            changes = tf.diff()
+            if changes:
+                click.echo("\n".join(tf.diff()) + "\n")
+                click.echo("Accept changes? [yn] ", nl=False)
+                c = click.getchar()
+                if c == 'y':
+                    break
+            if not changes:
+                click.echo("No changes made")
+                return
+        except ParamSchemaValidationError as e:
+            for error in e.errors:
+                click.echo(error, err=True)
+            click.echo('Continue editing? [yn] ', nl=False)
+            c = click.getchar()
+            click.echo()
+            if c != 'y':
+                tf.delete()
+                raise click.Abort()
+            else:
+                continue
+
+    tf.push_updates(config["schema"], config.get("tags", {}))
+    tf.delete()
 
 
 if __name__ == '__main__':
