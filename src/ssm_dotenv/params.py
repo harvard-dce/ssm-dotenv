@@ -91,7 +91,7 @@ class Stage:
         if len(errors):
             raise ParamSchemaValidationError(errors=errors)
 
-    def delete(self, config, param_name):
+    def delete_param(self, config, param_name):
         Param.delete(self.project, self.name, param_name)
 
 
@@ -117,6 +117,8 @@ class Param:
                param_value, param_type, param_desc=None,
                overwrite=False, tags={}):
         param_path = create_param_path(project, stage_name, param_name)
+        if not param_value:
+            return None
 
         if param_type not in VALID_PARAM_TYPES:
             raise ParamCreateError("Invalid parameter type: {}".format(param_type))
@@ -177,89 +179,3 @@ class Param:
     @property
     def dotenv(self):
         return "{}={}".format(self.envname, self.value)
-
-
-class TemporaryFile:
-
-    def __init__(self, stage):
-        self.stage = stage
-        dotenv_content = []
-        for param in self.stage.get_params():
-            dotenv_content.append(param.dotenv)
-
-        # write a temporary file with the current parameters
-        f = tempfile.NamedTemporaryFile(mode='w', delete=False)
-        f.write("\n".join(dotenv_content) + "\n")
-        f.close()
-
-        self.name = f.name
-        self.envs = {}
-
-    def open_editor(self, schema):
-        editor = os.environ.get("EDITOR")
-        if not editor:
-            editor = "vim"
-
-        call([editor, self.name])
-
-        self.validate(schema)
-
-        self.envs = {}
-        with open(self.name, "r") as tf:
-            lines = tf.readlines()
-            for line in lines:
-                env_name, env_value = line.strip().split("=")
-                self.envs[env_name] = env_value
-
-    def validate(self, schema):
-        self.stage.validate(schema, self.name)
-
-    def diff(self):
-        existing_params = {p.name: p.value for p in self.stage.get_params()}
-
-        changes = []
-        for param in self.envs:
-            if param not in existing_params:
-                changes.append("Adding param {}={}".format(param, self.envs[local_param]))
-            elif existing_params[param] != self.envs[param]:
-                changes.append("Updating param {} from {} to {}"
-                               .format(param, existing_params[param],
-                                       self.envs[param]))
-
-        for param in self.deleted_params():
-            changes.append("Deleting param {}".format(param))
-
-        return changes
-
-    def deleted_params(self):
-        deleted_params = {}
-        existing_params = {p.name: p.value for p in self.stage.get_params()}
-
-        for param in existing_params:
-            if param not in self.envs:
-                deleted_params[param] = existing_params[value]
-
-        return deleted_params
-
-    def push_updates(self, schema, tags):
-        self.validate(schema)
-        for param in self.envs:
-            param_type = schema[param][0]
-            param_desc = None
-            if len(schema[param]) > 1:
-                param_desc = schema[param][1]
-            args = [param, self.envs[param], param_type, param_desc]
-
-            Param.create(
-                self.stage.project,
-                self.stage.name,
-                *args,
-                overwrite=True,
-                tags=tags
-            )
-
-        for param in self.deleted_params():
-            self.stage.delete(param)
-
-    def delete(self):
-        os.unlink(self.name)
