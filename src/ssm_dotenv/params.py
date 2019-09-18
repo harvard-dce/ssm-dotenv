@@ -1,9 +1,6 @@
 
 import boto3
 from pathlib import Path
-import os
-from subprocess import call
-import tempfile
 from ssm_cache import SSMParameterGroup, SSMParameter, InvalidParameterError
 
 
@@ -69,6 +66,10 @@ class Stage:
         for ssm_param in group.parameters("/"):
             yield Param(ssm_param)
 
+    def get_param(self, name):
+        group = SSMParameterGroup(base_path=self.path)
+        return group.parameter("/{}".format(name))
+
     def validate(self, schema, filename=None):
         existing_params = set()
         if filename:
@@ -91,8 +92,10 @@ class Stage:
         if len(errors):
             raise ParamSchemaValidationError(errors=errors)
 
-    def delete_param(self, config, param_name):
-        Param.delete(self.project, self.name, param_name)
+    def delete_param(self, param_name):
+        param = self.get_param(param_name)
+        if param:
+            param.delete()
 
 
 class Param:
@@ -101,15 +104,13 @@ class Param:
         self.ssm_param = ssm_param
         self.path = Path(ssm_param.full_name)
 
-    @classmethod
-    def delete(cls, project, stage_name, param_name):
-        param_path = create_param_path(project, stage_name, param_name)
+    def delete(self):
         try:
-            ssm.delete_parameter(Name=param_path)
-            return param_path
+            ssm.delete_parameter(Name=str(self.path))
+            return self.path
         except ssm.exceptions.ClientError as e:
             raise ParamDeleteError(
-                "Delete {} failed: {}".format(param_path, e)
+                "Delete {} failed: {}".format(self.path, e)
             )
 
     @classmethod

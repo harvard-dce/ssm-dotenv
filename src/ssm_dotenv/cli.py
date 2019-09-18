@@ -9,8 +9,7 @@ from subprocess import call
 from os.path import join, dirname
 from dotenv import load_dotenv
 from pathlib import Path
-from .params import get_stages, Stage, Param, \
-    ParamSchemaValidationError, ParamCreateError, ParamDeleteError
+from .params import get_stages, Stage, Param, ParamSchemaValidationError
 
 env_file = join(dirname(__file__), '.env')
 load_dotenv(env_file)
@@ -18,23 +17,18 @@ load_dotenv(env_file)
 CONFIG_FILE = '.ssm-dotenv'
 
 
+def config_path(config_file):
+    return config_file and Path(config_file) or Path(CONFIG_FILE)
+
+
 def get_config(config_file):
-    config_path = config_file and Path(config_file) or Path(CONFIG_FILE)
-    if not config_path.exists():
-        click.echo("ssm-dotenv config not found at {}".format(config_path))
+    path = config_path(config_file)
+    if not path.exists():
+        click.echo("ssm-dotenv config not found at {}".format(path))
         raise click.Abort()
-    with open(config_path, 'r') as f:
+    with open(path, 'r') as f:
         config = toml.load(f)
-    ctx = click.get_current_context()
-    ctx.meta["CONFIG_PATH"] = config_path
     return config
-
-
-def update_config(config):
-    ctx = click.get_current_context()
-    config_path = ctx.meta["CONFIG_PATH"]
-    with open(config_path, 'w') as f:
-        toml.dump(config, f)
 
 
 def switch_to(stage):
@@ -49,88 +43,55 @@ def current_stage():
     return name
 
 
-# def push(config, input):
-#     create_args = []
-#     for line in input:
-#         param_name, param_value = line.strip().split("=")
-#         if param_name not in config["schema"]:
-#             click.echo("{} not found in schema".format(param_name))
-#             raise click.Abort()
-#         param_type = config["schema"][param_name]
-#         create_args.append([param_name, param_value, param_type])
-#     for argset in create_args:
-#         try:
-#             param = Param.create(
-#                 config["project"],
-#                 current_stage(),
-#                 *argset,
-#                 overwrite=True,
-#                 tags=config.get("tags", {})
-#             )
-#             click.echo("Created {}".format(param.full_name))
-#         except ParamCreateError as e:
-#             click.echo(e, err=True)
-#             raise click.Abort()
+def getenv(name, required=True):
+    config = get_config(CONFIG_FILE)
+    stage = Stage(config["project"], current_stage())
+    param = stage.get_param(name)
+
+    if param is None:
+        val = None
+    else:
+        val = param.value.strip('"').strip("'")
+
+    if required and val is None:
+        raise Exception("{} not defined".format(name))
 
 
 @click.group()
 @click.option('--config-file', help="path to alternative ssm-dotenv config file")
 @click.pass_context
 def cli(ctx, config_file):
+    ctx.meta[CONFIG_FILE] = config_file
     ctx.obj = config_file
+    if ctx.invoked_subcommand != 'config-example':
+        if not os.path.exists(config_path(config_file)):
+            click.echo("Config file {} doesn't exist.".format(config_file))
+            raise click.Abort()
+
+    if ctx.invoked_subcommand in ['edit', 'list-parameters', 'delete']:
+        if not current_stage():
+            click.echo("No current stage!")
+            click.echo("Try `ssm-dotenv new` or `ssm-dotenv switch`")
+            raise click.Abort()
+
+
+@cli.command()
+def config_example():
+    click.echo('project=project-name\n'
+               '\n'
+               '[schema]\n'
+               'PARAM_NAME0 = ["String", "description"]\n'
+               'PARAM_NAME1 = ["SecureString", "description"]\n'
+               'PARAM_NAME2 = ["StringList", "description"]\n'
+               '\n'
+               '[tags]\n'
+               'ssm_dotenv="1"')
 
 
 @cli.command()
 @click.pass_obj
 def show_config(config_file):
-    click.echo(json.dumps(get_config(), indent=2))
-
-
-@cli.command()
-@click.argument('param-name')
-@click.argument('param-value')
-@click.argument('param-type', required=False)
-@click.pass_obj
-def add(config_file, param_name, param_value, param_type):
-    config = get_config(config_file)
-    if param_type is None:
-        if param_name in config["schema"]:
-            param_type = config["schema"][param_name]
-        else:
-            click.echo("Unknown param type for {}".format(param_name), err=True)
-            raise click.Abort()
-    try:
-        param = Param.create(
-            config["project"],
-            current_stage(),
-            param_name,
-            param_value,
-            param_type,
-            overwrite=True,
-            tags=config.get("tags", {})
-        )
-        click.echo("Created {}".format(param.full_name))
-        if param_name not in config["schema"] or \
-                config["schema"][param_name] != param_type:
-            config["schema"][param_name] = param_type
-            update_config(config)
-            click.echo("Schema updated")
-    except ParamCreateError as e:
-        click.echo(e, err=True)
-        raise click.Abort()
-
-
-@cli.command()
-@click.pass_obj
-def validate(config_file):
-    config = get_config(config_file)
-    stage = Stage(config["project"], current_stage())
-    try:
-        stage.validate(config["schema"])
-        click.echo("All good!")
-    except ParamSchemaValidationError as e:
-        click.echo("Schema validation errors:\n{}" \
-                   .format("\n".join(e.errors)))
+    click.echo(json.dumps(get_config(config_file), indent=2))
 
 
 @cli.command()
@@ -172,6 +133,9 @@ def __select_a_stage(project):
 @cli.command()
 @click.pass_obj
 def list_parameters(config_file):
+    """
+    List parameters in current stage.
+    """
     config = get_config(config_file)
     stage = Stage(config["project"], current_stage())
 
@@ -183,6 +147,9 @@ def list_parameters(config_file):
 @cli.command()
 @click.pass_obj
 def new(config_file):
+    """
+    Create a new stage.
+    """
     config = get_config(config_file)
 
     existing_names = [s.name for s in get_stages(config["project"])]
@@ -207,10 +174,34 @@ def new(config_file):
 @cli.command()
 @click.pass_obj
 def edit(config_file):
+    """
+    Edit current stage.
+    """
     __edit_stage(config_file)
 
 
+@cli.command()
+@click.pass_obj
+def delete(config_file):
+    """
+    Delete current stage.
+    """
+    stage = Stage(get_config(config_file)["project"], current_stage())
+    click.confirm("Are you sure you want to delete all parameters in path {}?".format(stage.path), abort=True)
+    stage_name = click.prompt("Type name of stage to confirm")
+
+    if stage_name != stage.name:
+        raise click.Abort()
+
+    for param in stage.get_params():
+        click.echo("Deleting {}={}".format(param.path, param.dotenv))
+        param.delete()
+
+    switch_to('')
+
+
 def __edit_stage(config_file, copy_values_from=None):
+
     stage = Stage(get_config(config_file)["project"], current_stage())
     tf = TemporaryFile(config_file, stage, copy_values_from)
 
@@ -346,7 +337,6 @@ class TemporaryFile:
 
     def delete(self):
         os.unlink(self.name)
-
 
 
 if __name__ == '__main__':
