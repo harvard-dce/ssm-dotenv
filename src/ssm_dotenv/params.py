@@ -47,6 +47,8 @@ class Stage:
     def __init__(self, project, stage_name):
         self.project = project
         self.name = stage_name
+        if self.name is None:
+            raise ParamCreateError
 
     @property
     def project_path(self):
@@ -64,8 +66,19 @@ class Stage:
         for ssm_param in group.parameters("/"):
             yield Param(ssm_param)
 
-    def validate(self, schema):
-        existing_params = set([x.name for x in self.get_params()])
+    def get_param(self, name):
+        group = SSMParameterGroup(base_path=self.path)
+        return group.parameter("/{}".format(name))
+
+    def validate(self, schema, filename=None):
+        existing_params = set()
+        if filename:
+            with open(filename, "r") as f:
+                for line in f.readlines():
+                    existing_params.add(line.strip().split("=")[0])
+        else:
+            existing_params = set([x.name for x in self.get_params()])
+
         schema_params = set(schema.keys())
         errors = []
         for missing in existing_params.difference(schema_params):
@@ -79,6 +92,11 @@ class Stage:
         if len(errors):
             raise ParamSchemaValidationError(errors=errors)
 
+    def delete_param(self, param_name):
+        param = self.get_param(param_name)
+        if param:
+            param.delete()
+
 
 class Param:
 
@@ -86,23 +104,22 @@ class Param:
         self.ssm_param = ssm_param
         self.path = Path(ssm_param.full_name)
 
-
-    @classmethod
-    def delete(cls, project, stage_name, param_name):
-        param_path = create_param_path(project, stage_name, param_name)
+    def delete(self):
         try:
-            ssm.delete_parameter(Name=param_path)
-            return param_path
+            ssm.delete_parameter(Name=str(self.path))
+            return self.path
         except ssm.exceptions.ClientError as e:
             raise ParamDeleteError(
-                "Delete {} failed: {}".format(param_path, e)
+                "Delete {} failed: {}".format(self.path, e)
             )
-
 
     @classmethod
     def create(cls, project, stage_name, param_name,
-               param_value, param_type, overwrite=False, tags={}):
+               param_value, param_type, param_desc=None,
+               overwrite=False, tags={}):
         param_path = create_param_path(project, stage_name, param_name)
+        if not param_value:
+            return None
 
         if param_type not in VALID_PARAM_TYPES:
             raise ParamCreateError("Invalid parameter type: {}".format(param_type))
@@ -114,6 +131,7 @@ class Param:
             ]
             param_resp = ssm.put_parameter(
                 Name=param_path,
+                Description=param_desc,
                 Value=param_value,
                 Type=param_type,
                 Overwrite=overwrite
