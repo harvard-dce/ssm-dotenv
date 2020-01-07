@@ -180,3 +180,7 @@ class Param:
     @property
     def dotenv(self):
         return "{}={}".format(self.envname, self.value)
+
+    @property
+    def type(self):
+        return ssm.get_parameter(Name=str(self.path))['Parameter']['Type']

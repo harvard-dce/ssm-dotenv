@@ -277,19 +277,39 @@ class TemporaryFile:
         self.stage.validate(schema, self.name)
 
     def diff(self):
-        existing_params = {p.name: p.value for p in self.stage.get_params()}
+        config = get_config(self.config_file)
+        schema = config["schema"]
+        existing_params = {p.name: p for p in self.stage.get_params()}
 
         changes = []
         for param in self.envs:
             if param not in existing_params:
                 if self.envs[param]:
-                    changes.append("Adding param {}={}".format(param, self.envs[param]))
+                    # in schema but not yet in parameter store
+                    param_type = schema[param][0]
+                    changes.append(
+                        "Adding param of type {} {}={}."
+                        .format(param_type, param, self.envs[param])
+                    )
                 else:
-                    changes.append("Warning: param {} not defined".format(param))
-            elif existing_params[param] != self.envs[param]:
-                changes.append("Updating param {} from {} to {}"
-                               .format(param, existing_params[param],
-                                       self.envs[param]))
+                    # not in schema
+                    changes.append(
+                        "Warning: param {} not defined in schema."
+                        " Add to schema before accepting changes.".format(param)
+                    )
+            else:
+                if existing_params[param].value != self.envs[param]:
+                    changes.append("Updating param {} from {} to {}"
+                                   .format(param, existing_params[param].value,
+                                           self.envs[param]))
+                current_param_type = existing_params[param].type
+                schema_param_type = schema[param][0]
+                if current_param_type != schema_param_type:
+                    changes.append("Changing param {} from type {} to type {}."
+                                   .format(
+                                        param,
+                                        current_param_type,
+                                        schema_param_type))
 
         for param in self.deleted_params():
             changes.append("Deleting param {}".format(param))
@@ -315,7 +335,7 @@ class TemporaryFile:
             if param not in schema:
                 click.echo(
                     "Param {}(value={}) not in schema, skipping update"
-                        .format(param, self.envs[param])
+                    .format(param, self.envs[param])
                 )
                 continue
             param_type = schema[param][0]
